@@ -1,0 +1,189 @@
+# ===================== 1. 导入库 =====================
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import TimeSeriesSplit, train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+# ===================== 2. 数据加载与对齐（适配你的机组数据） =====================
+def load_and_align_data():
+    """
+    加载机组实际负荷、上限、下限、升降率，对齐1分钟粒度
+    返回：对齐后的完整数据表（含所有特征）
+    """
+    # ---------------------- 1. 加载你的数据 ----------------------
+    # 替换为你的CSV文件路径
+    df_actual = pd.read_csv("机组实际负荷366.csv", parse_dates=["Timestamp"], index_col="Timestamp")
+    df_upper = pd.read_csv("负荷上限368.csv", parse_dates=["Timestamp"], index_col="Timestamp")
+    df_lower = pd.read_csv("负荷下限369.csv", parse_dates=["Timestamp"], index_col="Timestamp")
+    df_ramp = pd.read_csv("机组升降负荷率限制370.csv", parse_dates=["Timestamp"], index_col="Timestamp")
+
+    # 重命名列
+    df_actual.rename(columns={"Value": "actual_load"}, inplace=True)
+    df_upper.rename(columns={"Value": "load_upper"}, inplace=True)
+    df_lower.rename(columns={"Value": "load_lower"}, inplace=True)
+    df_ramp.rename(columns={"Value": "ramp_rate"}, inplace=True)
+
+    # ---------------------- 2. 统一1分钟时间轴 ----------------------
+    start = df_actual.index.min().floor("min")
+    end = df_actual.index.max().ceil("min")
+    time_axis = pd.date_range(start=start, end=end, freq="T")
+    aligned_df = pd.DataFrame(index=time_axis)
+
+    # 合并所有数据（前向填充，适配秒级→分钟级）
+    aligned_df = aligned_df.join([
+        df_actual["actual_load"].resample("T").mean(),
+        df_upper["load_upper"].resample("T").mean(),
+        df_lower["load_lower"].resample("T").mean(),
+        df_ramp["ramp_rate"].resample("T").mean()
+    ])
+
+    # ---------------------- 3. 数据预处理（贴合文档） ----------------------
+    # 3.1 异常值过滤（负荷<0、超限值→标记缺失）
+    aligned_df["actual_load"] = aligned_df.where(
+        (aligned_df["actual_load"] >= aligned_df["load_lower"]) & 
+        (aligned_df["actual_load"] <= aligned_df["load_upper"]) &
+        (aligned_df["actual_load"] >= 0)
+    )["actual_load"]
+
+    # 3.2 缺失值处理（贴合文档规则）
+    aligned_df["actual_load"] = aligned_df["actual_load"].interpolate(method="linear", limit=5)  # ≤5分钟插值
+    aligned_df["actual_load"] = aligned_df["actual_load"].fillna(method="ffill", limit=5)       # ≤5分钟前向填充
+
+    # ---------------------- 4. 特征工程（贴合文档） ----------------------
+    # 4.1 时间特征
+    aligned_df["hour"] = aligned_df.index.hour
+    aligned_df["weekday"] = aligned_df.index.weekday
+    aligned_df["is_holiday"] = 0  # 可接入节假日接口，这里模拟
+    aligned_df["is_peak"] = ((aligned_df["hour"] >= 8) & (aligned_df["hour"] <= 22)).astype(int)
+
+    # 4.2 滞后负荷特征（t-1~t-6，贴合文档）
+    for i in range(1, 7):
+        aligned_df[f"load_t{i}"] = aligned_df["actual_load"].shift(i)
+
+    # 4.3 气象特征（模拟，可接入真实气象API）
+    np.random.seed(42)
+    aligned_df["temperature"] = np.random.normal(25, 3, len(aligned_df))
+    aligned_df["humidity"] = np.random.normal(60, 8, len(aligned_df))
+    aligned_df["pressure"] = np.random.normal(1013, 5, len(aligned_df))
+    aligned_df["is_rain"] = np.random.randint(0, 2, len(aligned_df))
+
+    # 4.4 AGC指令特征（模拟，贴合AGC趋势任务）
+    aligned_df["agc_dir"] = np.random.choice([0,1,2], len(aligned_df), p=[0.7,0.2,0.1])
+
+    # 4.5 标准化（Z-Score，贴合文档）
+    scaler = StandardScaler()
+    feature_cols = [col for col in aligned_df.columns if col != "actual_load"]
+    aligned_df[feature_cols] = scaler.fit_transform(aligned_df[feature_cols])
+
+    # 去除空值（滞后特征前6行）
+    aligned_df = aligned_df.dropna()
+    print(f"✅ 数据对齐完成！共{len(aligned)}条1分钟数据")
+    return aligned_df
+
+# ===================== 3. XGBoost模型训练（贴合平台：1-4小时预测） =====================
+def train_load_prediction_model(aligned_df):
+    """
+    训练XGBoost负荷回归模型
+    返回：训练好的模型+评估指标+特征重要性
+    """
+    # 1. 划分特征/目标
+    X = aligned_df.drop(columns=["actual_load"])
+    y = aligned_df["actual_load"]
+
+    # 2. 时间序列划分（避免数据泄露）
+    tscv = TimeSeriesSplit(n_splits=5)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    # 3. 初始化XGBoost（回归任务，贴合文档选型）
+    model = xgb.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=300,
+        max_depth=7,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbosity=0
+    )
+
+    # 4. 训练模型
+    print("🚀 开始训练XGBoost负荷预测模型...")
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_test, y_test)],
+        early_stopping_rounds=20,
+        verbose=False
+    )
+
+    # 5. 模型评估
+    y_pred = model.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y))
+    r2 = r2_score(y_test, y_pred)
+    print(f"📊 模型评估：MAE={mae:.2f}, RMSE={rmse:.2f}, R²={r2:.2f}")
+
+    # 6. 特征重要性（贴合平台可视化）
+    feature_importance = pd.DataFrame({
+        "feature": X.columns,
+        "importance": model.feature_importances_
+    }).sort_values("importance", ascending=False)
+    print("\n🏆 特征重要性TOP5：")
+    print(feature_importance.head())
+
+    # 保存模型（贴合MLflow，简化版）
+    model.save_model("load_pred_xgb.json")
+    print("\n💾 模型已保存为：load_pred_xgb.json")
+    return model, feature_importance
+
+# ===================== 4. 在线预测（贴合平台API） =====================
+def predict_load(model, last_feature, horizon=240):
+    """
+    负荷预测API（贴合文档：horizon=240→4小时，步长1分钟）
+    参数：
+        model: 训练好的模型
+        last_feature: 最新特征（1分钟）
+        horizon: 预测步数（默认240=4小时）
+    返回：预测时间+负荷值
+    """
+    pred_result = []
+    current_feature = last_feature.copy()
+
+    for _ in range(horizon):
+        # 预测单分钟负荷
+        pred = model.predict(current_feature.reshape(1, -1))[0]
+        pred_result.append(pred)
+
+        # 更新滞后特征（滚动预测）
+        for i in range(6, 1, -1):
+            current_feature[f"load_t{i}"] = current_feature[f"load_t{i-1}"]
+        current_feature["load_t1"] = pred
+
+    # 生成预测时间轴
+    last_time = pd.to_datetime(current_feature.name)
+    pred_time = pd.date_range(start=last_time+pd.Timedelta(minutes=1), periods=horizon, freq="T")
+    pred_df = pd.DataFrame({"timestamp": pred_time, "pred_load": pred_result})
+    return pred_df
+
+# ===================== 5. 主程序执行 =====================
+if __name__ == "__main__":
+    # 1. 加载并对齐数据
+    aligned_data = load_and_align_data()
+
+    # 2. 训练模型
+    model, feat_importance = train_load_prediction_model(aligned_data)
+
+    # 3. 模拟在线预测（最新1分钟特征→预测4小时）
+    last_feat = aligned_data.iloc[-1].drop("actual_load")
+    pred_4h = predict_load(model, last_feat, horizon=240)
+    print("\n🔮 4小时负荷预测结果（前5分钟）：")
+    print(pred_4h.head())
+
+    # 保存结果
+    aligned_data.to_csv("aligned_load_data.csv", encoding="utf-8-sig")
+    pred_4h.to_csv("4h_load_pred.csv", encoding="utf-8-sig")
+    print("\n✅ 所有任务完成！")
